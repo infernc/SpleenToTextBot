@@ -1,0 +1,7 @@
+[INFO] Bot started and running.
+[INFO] User itsmine12 (453719960120852494) transcribed an empty result.
+[INFO] User itsmine12 (453719960120852494) transcribed an empty result.
+[INFO] User itsmine12 (453719960120852494) transcribed for itsmine12 (453719960120852494): "[gargling] [beep]"
+[INFO] User itsmine12 (453719960120852494) transcribed an empty result.
+[INFO] User itsmine12 (453719960120852494) transcribed an empty result.
+[INFO] Bot shutting down.

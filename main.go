@@ -29,13 +29,17 @@ type Logger struct {
 func (l *Logger) Logf(format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.logs = append(l.logs, fmt.Sprintf("[INFO] "+format, args...))
+	entry := fmt.Sprintf("[INFO] "+format, args...)
+	l.logs = append(l.logs, entry)
+	fmt.Println(entry)
 }
 
 func (l *Logger) Errorf(format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.logs = append(l.logs, fmt.Sprintf("[ERROR] "+format, args...))
+	entry := fmt.Sprintf("[ERROR] "+format, args...)
+	l.logs = append(l.logs, entry)
+	fmt.Println(entry)
 }
 
 func (l *Logger) SaveToFile() error {
@@ -227,6 +231,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 
 	if att == nil {
+		botLogger.Logf("Transcription request: user=%s (%s), targetUser=none, transcript=", m.Author.Username, m.Author.ID)
 		s.ChannelMessageSend(m.ChannelID, "No attachment found")
 		botLogger.Logf("User %s (%s) tried to transcribe but no attachment found.", m.Author.Username, m.Author.ID)
 		return
@@ -234,6 +239,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	tmpFile, err := downloadFile(att.URL)
 	if err != nil {
+		botLogger.Logf("Transcription request: user=%s (%s), targetUser=unknown, transcript=", m.Author.Username, m.Author.ID)
 		log.Printf("Download error: %v", err)
 		botLogger.Errorf("Download error for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
 		s.ChannelMessageSend(m.ChannelID, "Error transcribing: "+err.Error())
@@ -251,6 +257,17 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		}()
 		transcript, err = transcribe(tmpFile)
 	}()
+
+	username := "Someone"
+	userID := ""
+	if targetMsg != nil && targetMsg.Author != nil {
+		username = targetMsg.Author.Username
+		userID = targetMsg.Author.ID
+	}
+
+	// Log every transcription request, even if blank
+	botLogger.Logf("Transcription request: user=%s (%s), targetUser=%s (%s), transcript=%q", m.Author.Username, m.Author.ID, username, userID, transcript)
+
 	if err != nil {
 		log.Printf("Transcription failed: %v", err)
 		botLogger.Errorf("Transcription failed for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
@@ -260,20 +277,11 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	// If transcript is empty, send nothing
 	if strings.TrimSpace(transcript) == "" {
-		botLogger.Logf("User %s (%s) transcribed an empty result.", m.Author.Username, m.Author.ID)
+		// Already logged above
 		return
 	}
 
-	username := "Someone"
-	userID := ""
-	if targetMsg != nil && targetMsg.Author != nil {
-		username = targetMsg.Author.Username
-		userID = targetMsg.Author.ID
-	}
 	replyText := username + " said, \"" + transcript + "\""
-
-	// Log the usage
-	botLogger.Logf("User %s (%s) transcribed for %s (%s): %q", m.Author.Username, m.Author.ID, username, userID, transcript)
 
 	// Reply to the original message (the one with the voice note)
 	ref := &discordgo.MessageReference{
