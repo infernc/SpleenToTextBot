@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -9,13 +10,58 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/google/generative-ai-go/genai"
 	"github.com/joho/godotenv"
 	"google.golang.org/api/option"
 )
+
+// Logger struct for in-memory logging
+type Logger struct {
+	mu   sync.Mutex
+	logs []string
+}
+
+func (l *Logger) Logf(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logs = append(l.logs, fmt.Sprintf("[INFO] "+format, args...))
+}
+
+func (l *Logger) Errorf(format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.logs = append(l.logs, fmt.Sprintf("[ERROR] "+format, args...))
+}
+
+func (l *Logger) SaveToFile() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.logs) == 0 {
+		return nil
+	}
+	date := time.Now().Format("2006-01-02")
+	logDir := "logs"
+	if _, err := os.Stat(logDir); os.IsNotExist(err) {
+		os.Mkdir(logDir, 0755)
+	}
+	filePath := filepath.Join(logDir, fmt.Sprintf("%s-log.txt", date))
+	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for _, entry := range l.logs {
+		f.WriteString(entry + "\n")
+	}
+	return nil
+}
+
+var botLogger = &Logger{}
 
 // downloadFile downloads a file from a URL to a temp file and returns the local path
 func downloadFile(url string) (string, error) {
@@ -86,24 +132,32 @@ func main() {
 	// Load environment variables from .env
 	if err := godotenv.Load(); err != nil {
 		log.Println("No .env file found or error loading .env:", err)
+		botLogger.Logf("No .env file found or error loading .env: %v", err)
 	}
 
 	token := os.Getenv("DISCORD_TOKEN")
 	if token == "" {
+		botLogger.Errorf("DISCORD_TOKEN not set in environment")
+		botLogger.SaveToFile()
 		log.Fatal("DISCORD_TOKEN not set in environment")
 	}
 
 	dg, err := discordgo.New("Bot " + token)
 	if err != nil {
+		botLogger.Errorf("Error creating Discord session: %v", err)
+		botLogger.SaveToFile()
 		log.Fatalf("Error creating Discord session: %v", err)
 	}
 
 	dg.AddHandler(messageCreate)
 
 	if err := dg.Open(); err != nil {
+		botLogger.Errorf("Error opening Discord session: %v", err)
+		botLogger.SaveToFile()
 		log.Fatalf("Error opening Discord session: %v", err)
 	}
 	log.Println("Bot is now running. Press CTRL+C to exit.")
+	botLogger.Logf("Bot started and running.")
 
 	// Wait for a termination signal
 	stop := make(chan os.Signal, 1)
@@ -111,7 +165,11 @@ func main() {
 	<-stop
 
 	log.Println("Shutting down...")
+	botLogger.Logf("Bot shutting down.")
 	dg.Close()
+	if err := botLogger.SaveToFile(); err != nil {
+		log.Printf("Failed to save log: %v", err)
+	}
 }
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
@@ -143,12 +201,13 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		}
 	}
 
-	// If not found in reply, search last 5 messages in channel
+	// If not found in reply, search last 5 messages in channel for the most recent voice note
 	if att == nil {
 		msgs, err := s.ChannelMessages(m.ChannelID, 5, "", "", "")
 		if err == nil {
-			for _, msg := range msgs {
-				// skip the !transcribe command itself
+			// Iterate in reverse to get the most recent message with a voice note
+			for i := len(msgs) - 1; i >= 0; i-- {
+				msg := msgs[i]
 				if msg.ID == m.ID {
 					continue
 				}
@@ -169,12 +228,14 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	if att == nil {
 		s.ChannelMessageSend(m.ChannelID, "No attachment found")
+		botLogger.Logf("User %s (%s) tried to transcribe but no attachment found.", m.Author.Username, m.Author.ID)
 		return
 	}
 
 	tmpFile, err := downloadFile(att.URL)
 	if err != nil {
 		log.Printf("Download error: %v", err)
+		botLogger.Errorf("Download error for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
 		s.ChannelMessageSend(m.ChannelID, "Error transcribing: "+err.Error())
 		return
 	}
@@ -185,21 +246,34 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		defer func() {
 			if err := os.Remove(tmpFile); err != nil {
 				log.Printf("Failed to remove temp file: %v", err)
+				botLogger.Errorf("Failed to remove temp file: %v", err)
 			}
 		}()
 		transcript, err = transcribe(tmpFile)
 	}()
 	if err != nil {
 		log.Printf("Transcription failed: %v", err)
+		botLogger.Errorf("Transcription failed for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
 		s.ChannelMessageSend(m.ChannelID, "Error transcribing: "+err.Error())
 		return
 	}
 
+	// If transcript is empty, send nothing
+	if strings.TrimSpace(transcript) == "" {
+		botLogger.Logf("User %s (%s) transcribed an empty result.", m.Author.Username, m.Author.ID)
+		return
+	}
+
 	username := "Someone"
+	userID := ""
 	if targetMsg != nil && targetMsg.Author != nil {
 		username = targetMsg.Author.Username
+		userID = targetMsg.Author.ID
 	}
 	replyText := username + " said, \"" + transcript + "\""
+
+	// Log the usage
+	botLogger.Logf("User %s (%s) transcribed for %s (%s): %q", m.Author.Username, m.Author.ID, username, userID, transcript)
 
 	// Reply to the original message (the one with the voice note)
 	ref := &discordgo.MessageReference{
@@ -217,6 +291,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	})
 	if err != nil {
 		log.Printf("Failed to send transcript reply: %v", err)
+		botLogger.Errorf("Failed to send transcript reply for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
 	}
 }
 
@@ -225,6 +300,7 @@ func transcribe(filePath string) (string, error) {
 	transcript, err := transcribeAudio(filePath)
 	if err != nil {
 		log.Printf("transcribeAudio error: %v", err)
+		botLogger.Errorf("transcribeAudio error: %v", err)
 	}
 	return transcript, err
 }
