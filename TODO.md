@@ -1,0 +1,4 @@
+- [ ] deploy it to my server
+- [ ] make it reply to the voice message
+- [ ] list the user that said it before the message.
+- [ ] use ``` ``` for the message.

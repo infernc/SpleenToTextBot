@@ -120,36 +120,103 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	if len(m.Attachments) == 0 {
+	// Only respond to !transcribe
+	if strings.TrimSpace(m.Content) != "!transcribe" {
 		return
 	}
 
-	for _, att := range m.Attachments {
-		name := strings.ToLower(att.Filename)
-		// Only process audio files (voice messages are usually .ogg, often named like 'voice-message.ogg')
-		if !(strings.HasSuffix(name, ".ogg") || strings.HasSuffix(name, ".mp3") || strings.HasSuffix(name, ".wav")) {
-			continue // skip non-audio
-		}
+	var targetMsg *discordgo.Message
+	var att *discordgo.MessageAttachment
 
-		tmpFile, err := downloadFile(att.URL)
-		if err != nil {
-			log.Printf("Download error: %v", err)
-			s.ChannelMessageSend(m.ChannelID, "Error transcribing: "+err.Error())
-			continue
+	// If this message is a reply, check the referenced message
+	if m.MessageReference != nil && m.MessageReference.MessageID != "" {
+		refMsg, err := s.ChannelMessage(m.ChannelID, m.MessageReference.MessageID)
+		if err == nil && len(refMsg.Attachments) > 0 {
+			for _, a := range refMsg.Attachments {
+				name := strings.ToLower(a.Filename)
+				if strings.HasSuffix(name, ".ogg") || strings.HasSuffix(name, ".mp3") || strings.HasSuffix(name, ".wav") {
+					targetMsg = refMsg
+					att = a
+					break
+				}
+			}
 		}
-		defer os.Remove(tmpFile)
+	}
 
-		transcript, err := transcribe(tmpFile)
-		if err != nil {
-			log.Printf("Transcription failed: %v", err)
-			s.ChannelMessageSend(m.ChannelID, "Error transcribing: "+err.Error())
-			continue
+	// If not found in reply, search last 5 messages in channel
+	if att == nil {
+		msgs, err := s.ChannelMessages(m.ChannelID, 5, "", "", "")
+		if err == nil {
+			for _, msg := range msgs {
+				// skip the !transcribe command itself
+				if msg.ID == m.ID {
+					continue
+				}
+				for _, a := range msg.Attachments {
+					name := strings.ToLower(a.Filename)
+					if strings.HasSuffix(name, ".ogg") || strings.HasSuffix(name, ".mp3") || strings.HasSuffix(name, ".wav") {
+						targetMsg = msg
+						att = a
+						break
+					}
+				}
+				if att != nil {
+					break
+				}
+			}
 		}
+	}
 
-		_, err = s.ChannelMessageSend(m.ChannelID, transcript)
-		if err != nil {
-			log.Printf("Failed to send transcript: %v", err)
-		}
+	if att == nil {
+		s.ChannelMessageSend(m.ChannelID, "No attachment found")
+		return
+	}
+
+	tmpFile, err := downloadFile(att.URL)
+	if err != nil {
+		log.Printf("Download error: %v", err)
+		s.ChannelMessageSend(m.ChannelID, "Error transcribing: "+err.Error())
+		return
+	}
+
+	// Always remove the temp file, even if transcription fails
+	var transcript string
+	func() {
+		defer func() {
+			if err := os.Remove(tmpFile); err != nil {
+				log.Printf("Failed to remove temp file: %v", err)
+			}
+		}()
+		transcript, err = transcribe(tmpFile)
+	}()
+	if err != nil {
+		log.Printf("Transcription failed: %v", err)
+		s.ChannelMessageSend(m.ChannelID, "Error transcribing: "+err.Error())
+		return
+	}
+
+	username := "Someone"
+	if targetMsg != nil && targetMsg.Author != nil {
+		username = targetMsg.Author.Username
+	}
+	replyText := username + " said, \"" + transcript + "\""
+
+	// Reply to the original message (the one with the voice note)
+	ref := &discordgo.MessageReference{
+		MessageID: m.ID,
+		ChannelID: m.ChannelID,
+		GuildID:   m.GuildID,
+	}
+	if targetMsg != nil {
+		ref.MessageID = targetMsg.ID
+	}
+
+	_, err = s.ChannelMessageSendComplex(m.ChannelID, &discordgo.MessageSend{
+		Content:   replyText,
+		Reference: ref,
+	})
+	if err != nil {
+		log.Printf("Failed to send transcript reply: %v", err)
 	}
 }
 
@@ -194,12 +261,12 @@ func transcribeAudio(filePath string) (string, error) {
 		mimeType = "audio/wav"
 	}
 
-	prompt := []genai.Part{
-		genai.Text("Transcribe this audio file accurately:"),
-		genai.Blob{
-			MIMEType: mimeType,
-			Data:     data,
-		},
+	// Use a preallocated slice for prompt
+	prompt := make([]genai.Part, 2)
+	prompt[0] = genai.Text("Transcribe this audio file accurately:")
+	prompt[1] = genai.Blob{
+		MIMEType: mimeType,
+		Data:     data,
 	}
 
 	resp, err := model.GenerateContent(ctx, prompt...)
@@ -211,15 +278,13 @@ func transcribeAudio(filePath string) (string, error) {
 		return "", nil
 	}
 
-	var transcript string
+	// Use strings.Builder for efficient string concatenation
+	var sb strings.Builder
 	for _, part := range resp.Candidates[0].Content.Parts {
 		if t, ok := part.(genai.Text); ok {
-			transcript += string(t)
+			sb.WriteString(string(t))
 		}
 	}
 
-	// Clean up the file after transcription
-	os.Remove(filePath)
-
-	return transcript, nil
+	return sb.String(), nil
 }
