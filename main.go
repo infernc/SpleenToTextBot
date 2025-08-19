@@ -109,38 +109,38 @@ func downloadFile(url string) (string, error) {
 	return tmpPath, nil
 }
 
-// // enhanceTranscriptWithGenAI refines a transcript using Gemini
-// func enhanceTranscriptWithGenAI(raw string) (string, error) {
-// 	apiKey := os.Getenv("GOOGLE_API_KEY")
-// 	if apiKey == "" {
-// 		return "", os.ErrNotExist
-// 	}
-// 	ctx := context.Background()
-// 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
-// 	if err != nil {
-// 		return "", err
-// 	}
-// 	defer client.Close()
+// enhanceTranscriptWithGenAI refines a transcript using Gemini
+func enhanceTranscriptWithGenAI(raw string) (string, error) {
+	apiKey := os.Getenv("GOOGLE_API_KEY")
+	if apiKey == "" {
+		return "", os.ErrNotExist
+	}
+	ctx := context.Background()
+	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
 
-// 	model := client.GenerativeModel("gemini-1.5-pro")
-// 	prompt := []genai.Part{
-// 		genai.Text("You are a helpful assistant that refines speech transcripts for clarity, grammar, and conciseness. Refine this transcript: " + raw),
-// 	}
-// 	resp, err := model.GenerateContent(ctx, prompt...)
-// 	if err != nil {
-// 		return "", err
-// 	}
-// 	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
-// 		return "", nil
-// 	}
-// 	var enhanced string
-// 	for _, part := range resp.Candidates[0].Content.Parts {
-// 		if t, ok := part.(genai.Text); ok {
-// 			enhanced += string(t)
-// 		}
-// 	}
-// 	return enhanced, nil
-// }
+	model := client.GenerativeModel("gemini-1.5-pro")
+	prompt := []genai.Part{
+		genai.Text("You are a helpful assistant that refines speech transcripts for clarity, grammar, and conciseness. Refine this transcript: " + raw),
+	}
+	resp, err := model.GenerateContent(ctx, prompt...)
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+		return "", nil
+	}
+	var enhanced string
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if t, ok := part.(genai.Text); ok {
+			enhanced += string(t)
+		}
+	}
+	return enhanced, nil
+}
 
 func main() {
 	// Load environment variables from .env
@@ -187,11 +187,8 @@ func main() {
 }
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	// --- Deduplication: skip if this message was already transcribed ---
-	dedupMu.Lock()
-	if _, exists := transcribedMsgSet[m.ID]; exists {
-		dedupMu.Unlock()
-		s.ChannelMessageSend(m.ChannelID, "This message was already transcribed.")
+	// Ignore messages from the bot itself
+	if m.Author.ID == s.State.User.ID {
 		return
 	}
 
@@ -236,37 +233,6 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	// Only respond to !transcribe
 	if strings.TrimSpace(m.Content) != "!transcribe" {
 		return
-	}
-
-	// --- Rate limit: 1 use per minute per user, except for 'itsmine12' ---
-	if m.Author.Username != "itsmine12" {
-		rateLimitMu.Lock()
-		now := time.Now()
-		times := userTranscribeTimestamps[m.Author.ID]
-		// Remove timestamps older than 1 minute
-		var recent []time.Time
-		for _, t := range times {
-			if now.Sub(t) < time.Minute {
-				recent = append(recent, t)
-			}
-		}
-		// Always update the timestamps, even if rate limited
-		userTranscribeTimestamps[m.Author.ID] = recent
-		if len(recent) >= 1 {
-			// Only send a rate limit message if this is the first over-limit message in the current minute
-			alreadyWarned := false
-			if len(recent) > 0 && now.Sub(recent[len(recent)-1]) < 5*time.Second {
-				alreadyWarned = true
-			}
-			if !alreadyWarned {
-				s.ChannelMessageSend(m.ChannelID, "Rate limit: Max 1 transcription per minute. Please wait.")
-			}
-			rateLimitMu.Unlock()
-			return
-		}
-		// Add this attempt
-		userTranscribeTimestamps[m.Author.ID] = append(recent, now)
-		rateLimitMu.Unlock()
 	}
 
 	var targetMsg *discordgo.Message
