@@ -1,7 +1,6 @@
 - [ ] deploy it to my server
-- [ ] make it reply to the voice message
-- [ ] list the user that said it before the message.
-- [ ] use ``` ``` for the message.
+- [x] make it reply to the voice message
+- [x] list the user that said it before the message.
 - [x] Rate limit 3 uses per minute max
 - [x] Character limit case.
 - [x] No transcribing duplicate messages.
