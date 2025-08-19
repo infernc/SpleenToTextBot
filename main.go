@@ -20,6 +20,16 @@ import (
 	"google.golang.org/api/option"
 )
 
+// --- Rate limiting and duplicate prevention globals ---
+var (
+	rateLimitMu  sync.Mutex
+	rateLimitMap = make(map[string][]int64) // userID -> timestamps
+
+	transcribedMu     sync.Mutex
+	transcribedMsgIDs = make(map[string]struct{}) // messageID -> struct{}
+	transcribedOrder  []string                    // maintain order of insertion for eviction
+)
+
 // Logger struct for in-memory logging
 type Logger struct {
 	mu   sync.Mutex
@@ -182,6 +192,44 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
+	// --- Rate limiting: 3 uses per 5 minutes per user ---
+	const rateLimitCount = 3
+	const rateLimitWindow = 5 * 60 // seconds
+
+	isRateLimited := func(userID string) (bool, int) {
+		rateLimitMu.Lock()
+		defer rateLimitMu.Unlock()
+		now := time.Now().Unix()
+		windowStart := now - rateLimitWindow
+		times := rateLimitMap[userID]
+		// Remove timestamps outside window
+		var filtered []int64
+		for _, t := range times {
+			if t >= windowStart {
+				filtered = append(filtered, t)
+			}
+		}
+		if len(filtered) >= rateLimitCount {
+			// Calculate minutes remaining
+			oldest := filtered[0]
+			resetIn := int((oldest + rateLimitWindow) - now)
+			if resetIn < 0 {
+				resetIn = 0
+			}
+			return true, (resetIn + 59) / 60 // round up to next minute
+		}
+		// Not limited, add this timestamp
+		filtered = append(filtered, now)
+		rateLimitMap[userID] = filtered
+		return false, 0
+	}
+
+	limited, mins := isRateLimited(m.Author.ID)
+	if limited {
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("rate limit exceeded. counter resets in %d minutes", mins))
+		return
+	}
+
 	// Only respond to !transcribe
 	if strings.TrimSpace(m.Content) != "!transcribe" {
 		return
@@ -228,6 +276,31 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 				}
 			}
 		}
+	}
+
+	// --- Prevent duplicate transcriptions ---
+	var audioMsgID string
+	if targetMsg != nil {
+		audioMsgID = targetMsg.ID
+	}
+	if audioMsgID != "" {
+		transcribedMu.Lock()
+		_, already := transcribedMsgIDs[audioMsgID]
+		if already {
+			transcribedMu.Unlock()
+			s.ChannelMessageSend(m.ChannelID, "This audio message has already been transcribed.")
+			return
+		}
+		// Mark as transcribed
+		transcribedMsgIDs[audioMsgID] = struct{}{}
+		transcribedOrder = append(transcribedOrder, audioMsgID)
+		// If over 1000, evict oldest
+		if len(transcribedOrder) > 1000 {
+			oldest := transcribedOrder[0]
+			delete(transcribedMsgIDs, oldest)
+			transcribedOrder = transcribedOrder[1:]
+		}
+		transcribedMu.Unlock()
 	}
 
 	if att == nil {
@@ -281,9 +354,88 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	replyText := username + " said, \"" + transcript + "\""
+	const maxDiscordMsgLen = 4000
 
-	// Reply to the original message (the one with the voice note)
+	// Helper to split at word boundaries
+	splitMessage := func(s string, maxLen int) []string {
+		var result []string
+		runes := []rune(s)
+		for len(runes) > 0 {
+			if len(runes) <= maxLen {
+				result = append(result, string(runes))
+				break
+			}
+			// Find last space before maxLen
+			cut := maxLen
+			for i := maxLen; i > 0; i-- {
+				if runes[i] == ' ' || runes[i] == '\n' {
+					cut = i
+					break
+				}
+			}
+			if cut == 0 {
+				cut = maxLen // no space found, hard cut
+			}
+			result = append(result, string(runes[:cut]))
+			runes = runes[cut:]
+			// Trim leading spaces/newlines
+			for len(runes) > 0 && (runes[0] == ' ' || runes[0] == '\n') {
+				runes = runes[1:]
+			}
+		}
+		return result
+	}
+
+	// --- Language detection and translation ---
+	detectAndTranslate := func(text string) (lang string, translation string, err error) {
+		apiKey := os.Getenv("GOOGLE_API_KEY")
+		if apiKey == "" {
+			return "", "", fmt.Errorf("GOOGLE_API_KEY not set")
+		}
+		ctx := context.Background()
+		client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+		if err != nil {
+			return "", "", err
+		}
+		defer client.Close()
+
+		model := client.GenerativeModel("gemini-1.5-pro")
+
+		// Detect language
+		promptDetect := []genai.Part{
+			genai.Text("What is the ISO 639-1 language code of the following text? Only output the code, nothing else.\n" + text),
+		}
+		resp, err := model.GenerateContent(ctx, promptDetect...)
+		if err != nil || len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+			return "", "", fmt.Errorf("language detection failed")
+		}
+		lang = strings.TrimSpace(fmt.Sprint(resp.Candidates[0].Content.Parts[0]))
+
+		if lang == "en" {
+			return lang, "", nil
+		}
+
+		// Translate to English
+		promptTrans := []genai.Part{
+			genai.Text("Translate this to English:\n" + text),
+		}
+		resp2, err := model.GenerateContent(ctx, promptTrans...)
+		if err != nil || len(resp2.Candidates) == 0 || resp2.Candidates[0].Content == nil {
+			return lang, "", fmt.Errorf("translation failed")
+		}
+		translation = ""
+		for _, part := range resp2.Candidates[0].Content.Parts {
+			if t, ok := part.(genai.Text); ok {
+				translation += string(t)
+			}
+		}
+		return lang, translation, nil
+	}
+
+	replyText := username + " said, \"" + transcript + "\""
+	lang, translation, terr := detectAndTranslate(transcript)
+
+	parts := splitMessage(replyText, maxDiscordMsgLen)
 	ref := &discordgo.MessageReference{
 		MessageID: m.ID,
 		ChannelID: m.ChannelID,
@@ -293,13 +445,30 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		ref.MessageID = targetMsg.ID
 	}
 
-	_, err = s.ChannelMessageSendComplex(m.ChannelID, &discordgo.MessageSend{
-		Content:   replyText,
-		Reference: ref,
-	})
-	if err != nil {
-		log.Printf("Failed to send transcript reply: %v", err)
-		botLogger.Errorf("Failed to send transcript reply for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
+	for i, part := range parts {
+		msgSend := &discordgo.MessageSend{Content: part}
+		if i == 0 {
+			msgSend.Reference = ref
+		}
+		_, err = s.ChannelMessageSendComplex(m.ChannelID, msgSend)
+		if err != nil {
+			log.Printf("Failed to send transcript reply: %v", err)
+			botLogger.Errorf("Failed to send transcript reply for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
+			break
+		}
+	}
+
+	// If not English and translation succeeded, send translation as a new message
+	if lang != "en" && translation != "" && terr == nil {
+		transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
+		for _, part := range transParts {
+			_, err = s.ChannelMessageSend(m.ChannelID, part)
+			if err != nil {
+				log.Printf("Failed to send translation: %v", err)
+				botLogger.Errorf("Failed to send translation for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
+				break
+			}
+		}
 	}
 }
 
@@ -326,7 +495,7 @@ func transcribeAudio(filePath string) (string, error) {
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-2.5-pro")
+	model := client.GenerativeModel("gemini-1.5-pro")
 
 	// Read audio file bytes
 	data, err := os.ReadFile(filePath)
