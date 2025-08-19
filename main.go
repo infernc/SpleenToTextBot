@@ -20,6 +20,16 @@ import (
 	"google.golang.org/api/option"
 )
 
+// --- Rate limiting and deduplication globals ---
+var (
+	rateLimitMu              sync.Mutex
+	userTranscribeTimestamps = make(map[string][]time.Time) // userID -> slice of timestamps
+
+	dedupMu           sync.Mutex
+	transcribedMsgIDs = make([]string, 0, 1000)   // FIFO queue of message IDs
+	transcribedMsgSet = make(map[string]struct{}) // for fast lookup
+)
+
 // Logger struct for in-memory logging
 type Logger struct {
 	mu   sync.Mutex
@@ -99,38 +109,38 @@ func downloadFile(url string) (string, error) {
 	return tmpPath, nil
 }
 
-// enhanceTranscriptWithGenAI refines a transcript using Gemini
-func enhanceTranscriptWithGenAI(raw string) (string, error) {
-	apiKey := os.Getenv("GOOGLE_API_KEY")
-	if apiKey == "" {
-		return "", os.ErrNotExist
-	}
-	ctx := context.Background()
-	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
-	if err != nil {
-		return "", err
-	}
-	defer client.Close()
+// // enhanceTranscriptWithGenAI refines a transcript using Gemini
+// func enhanceTranscriptWithGenAI(raw string) (string, error) {
+// 	apiKey := os.Getenv("GOOGLE_API_KEY")
+// 	if apiKey == "" {
+// 		return "", os.ErrNotExist
+// 	}
+// 	ctx := context.Background()
+// 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+// 	if err != nil {
+// 		return "", err
+// 	}
+// 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-1.5-pro")
-	prompt := []genai.Part{
-		genai.Text("You are a helpful assistant that refines speech transcripts for clarity, grammar, and conciseness. Refine this transcript: " + raw),
-	}
-	resp, err := model.GenerateContent(ctx, prompt...)
-	if err != nil {
-		return "", err
-	}
-	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
-		return "", nil
-	}
-	var enhanced string
-	for _, part := range resp.Candidates[0].Content.Parts {
-		if t, ok := part.(genai.Text); ok {
-			enhanced += string(t)
-		}
-	}
-	return enhanced, nil
-}
+// 	model := client.GenerativeModel("gemini-1.5-pro")
+// 	prompt := []genai.Part{
+// 		genai.Text("You are a helpful assistant that refines speech transcripts for clarity, grammar, and conciseness. Refine this transcript: " + raw),
+// 	}
+// 	resp, err := model.GenerateContent(ctx, prompt...)
+// 	if err != nil {
+// 		return "", err
+// 	}
+// 	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil {
+// 		return "", nil
+// 	}
+// 	var enhanced string
+// 	for _, part := range resp.Candidates[0].Content.Parts {
+// 		if t, ok := part.(genai.Text); ok {
+// 			enhanced += string(t)
+// 		}
+// 	}
+// 	return enhanced, nil
+// }
 
 func main() {
 	// Load environment variables from .env
@@ -177,14 +187,58 @@ func main() {
 }
 
 func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
-	// Ignore messages from the bot itself
-	if m.Author.ID == s.State.User.ID {
+	// --- Deduplication: skip if this message was already transcribed ---
+	dedupMu.Lock()
+	if _, exists := transcribedMsgSet[m.ID]; exists {
+		dedupMu.Unlock()
+		s.ChannelMessageSend(m.ChannelID, "This message was already transcribed.")
+		return
+	}
+	// Add this message ID to the set and queue
+	transcribedMsgIDs = append(transcribedMsgIDs, m.ID)
+	transcribedMsgSet[m.ID] = struct{}{}
+	// Maintain max size 1000
+	if len(transcribedMsgIDs) > 1000 {
+		oldest := transcribedMsgIDs[0]
+		transcribedMsgIDs = transcribedMsgIDs[1:]
+		delete(transcribedMsgSet, oldest)
+	}
+	dedupMu.Unlock()
+
+	// Only respond to exact '!transcribe' from users (not bots)
+	if m.Author.ID == s.State.User.ID || m.Content != "!transcribe" {
 		return
 	}
 
-	// Only respond to !transcribe
-	if strings.TrimSpace(m.Content) != "!transcribe" {
-		return
+	// --- Rate limit: 1 use per minute per user, except for 'itsmine12' ---
+	if m.Author.Username != "itsmine12" {
+		rateLimitMu.Lock()
+		now := time.Now()
+		times := userTranscribeTimestamps[m.Author.ID]
+		// Remove timestamps older than 1 minute
+		var recent []time.Time
+		for _, t := range times {
+			if now.Sub(t) < time.Minute {
+				recent = append(recent, t)
+			}
+		}
+		// Always update the timestamps, even if rate limited
+		userTranscribeTimestamps[m.Author.ID] = recent
+		if len(recent) >= 1 {
+			// Only send a rate limit message if this is the first over-limit message in the current minute
+			alreadyWarned := false
+			if len(recent) > 0 && now.Sub(recent[len(recent)-1]) < 5*time.Second {
+				alreadyWarned = true
+			}
+			if !alreadyWarned {
+				s.ChannelMessageSend(m.ChannelID, "Rate limit: Max 1 transcription per minute. Please wait.")
+			}
+			rateLimitMu.Unlock()
+			return
+		}
+		// Add this attempt
+		userTranscribeTimestamps[m.Author.ID] = append(recent, now)
+		rateLimitMu.Unlock()
 	}
 
 	var targetMsg *discordgo.Message
@@ -283,7 +337,36 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 
 	replyText := username + " said, \"" + transcript + "\""
 
-	// Reply to the original message (the one with the voice note)
+	// Discord message character limit (actual limit is 2000)
+	const maxLen = 2000
+	var chunks []string
+	if len(replyText) <= maxLen {
+		chunks = []string{replyText}
+	} else {
+		words := strings.Fields(replyText)
+		var current strings.Builder
+		for _, word := range words {
+			// +1 for space if not first word
+			addLen := len(word)
+			if current.Len() > 0 {
+				addLen++
+			}
+			if current.Len()+addLen > maxLen {
+				chunks = append(chunks, current.String())
+				current.Reset()
+				current.WriteString(word)
+			} else {
+				if current.Len() > 0 {
+					current.WriteByte(' ')
+				}
+				current.WriteString(word)
+			}
+		}
+		if current.Len() > 0 {
+			chunks = append(chunks, current.String())
+		}
+	}
+
 	ref := &discordgo.MessageReference{
 		MessageID: m.ID,
 		ChannelID: m.ChannelID,
@@ -292,14 +375,17 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if targetMsg != nil {
 		ref.MessageID = targetMsg.ID
 	}
-
-	_, err = s.ChannelMessageSendComplex(m.ChannelID, &discordgo.MessageSend{
-		Content:   replyText,
-		Reference: ref,
-	})
-	if err != nil {
-		log.Printf("Failed to send transcript reply: %v", err)
-		botLogger.Errorf("Failed to send transcript reply for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
+	for _, chunk := range chunks {
+		_, err = s.ChannelMessageSendComplex(m.ChannelID, &discordgo.MessageSend{
+			Content:   chunk,
+			Reference: ref,
+		})
+		if err != nil {
+			log.Printf("Failed to send transcript reply: %v", err)
+			botLogger.Errorf("Failed to send transcript reply for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
+		}
+		// Only reference the original message for the first chunk
+		ref = nil
 	}
 }
 
@@ -326,7 +412,7 @@ func transcribeAudio(filePath string) (string, error) {
 	}
 	defer client.Close()
 
-	model := client.GenerativeModel("gemini-2.5-pro")
+	model := client.GenerativeModel("gemini-2.5-flash-lite")
 
 	// Read audio file bytes
 	data, err := os.ReadFile(filePath)
