@@ -1,0 +1,1 @@
+.gitkeep file to ensure the 'logs' directory is tracked by git, even if empty.

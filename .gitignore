@@ -5,6 +5,7 @@
 *.so
 *.dylib
 *.test
+*.config
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
@@ -24,4 +25,5 @@ go.work.sum
 .DS_Store
 Thumbs.db
 
-logs
+/logs/*
+!/logs/.gitkeep
