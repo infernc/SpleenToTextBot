@@ -23,6 +23,44 @@ import (
 // Helper to split at word boundaries
 const maxDiscordMsgLen = 4000
 
+// getSpeechmaticsUsage fetches usage statistics from Speechmatics API
+func getSpeechmaticsUsage() string {
+	apiKey := os.Getenv("SPEECHMATICS_API_KEY")
+	if apiKey == "" {
+		return "SPEECHMATICS_API_KEY not set in environment"
+	}
+	url := "https://asr.api.speechmatics.com/v2/usage"
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "Error creating usage request: " + err.Error()
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "Error fetching usage statistics: " + err.Error()
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "Error reading usage response: " + err.Error()
+	}
+	// Parse response
+	var usageResp struct {
+		Details []struct {
+			DurationHrs float64 `json:"duration_hrs"`
+		} `json:"details"`
+	}
+	if err := json.Unmarshal(body, &usageResp); err != nil {
+		return "Error parsing usage response: " + err.Error()
+	}
+	var totalMinutes float64
+	for _, d := range usageResp.Details {
+		totalMinutes += d.DurationHrs * 60.0
+	}
+	return fmt.Sprintf("Speechmatics API usage: %.2f minutes used out of 480.", totalMinutes)
+}
+
 func splitMessage(s string, maxLen int) []string {
 	var result []string
 	runes := []rune(s)
@@ -478,8 +516,14 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	// Only respond to !transcribe or !t
+	// Respond to !usage command
 	cmd := strings.TrimSpace(m.Content)
+	if cmd == "!usage" {
+		usageMsg := getSpeechmaticsUsage()
+		s.ChannelMessageSend(m.ChannelID, usageMsg)
+		return
+	}
+	// Only respond to !transcribe or !t
 	if cmd != "!transcribe" && cmd != "!t" {
 		return
 	}
@@ -605,7 +649,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			}
 			return
 		} else if already {
-			s.ChannelMessageSend(m.ChannelID, "This audio message has already been transcribed.")
+			s.ChannelMessageSend(m.ChannelID, "This audio message has already been rejected.")
 			return
 		}
 		// Mark as transcribed
