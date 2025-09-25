@@ -167,7 +167,6 @@ func transcribeWithJobID(filePath string) (string, string, error) {
 		if err != nil {
 			return "", jr.ID, err
 		}
-		log.Printf("Speechmatics job status response: %s", string(statusBody))
 		var statusObj struct {
 			Job struct {
 				Status string `json:"status"`
@@ -215,6 +214,90 @@ func transcribeWithJobID(filePath string) (string, string, error) {
 }
 
 // --- Rate limiting and duplicate prevention globals ---
+// var (
+// --- Language detection and translation ---
+// Uses OpenRouter Grok 4 Fast for detection and translation
+func detectAndTranslate(text string) (lang string, translation string, err error) {
+	apiKey := os.Getenv("OPENROUTER_API_KEY")
+	if apiKey == "" {
+		return "", "", fmt.Errorf("OPENROUTER_API_KEY not set in environment")
+	}
+
+	// 1. Detect language
+	detectPrompt := map[string]interface{}{
+		"model": "x-ai/grok-4-fast:free",
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a helpful assistant that detects the ISO 639-1 language code of the following text. Only output the code, nothing else."},
+			{"role": "user", "content": text},
+		},
+		"max_tokens": 8,
+	}
+	detectBody, _ := json.Marshal(detectPrompt)
+	req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(detectBody))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	var detectResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	body, _ := io.ReadAll(resp.Body)
+	json.Unmarshal(body, &detectResp)
+	lang = ""
+	if len(detectResp.Choices) > 0 {
+		lang = strings.TrimSpace(detectResp.Choices[0].Message.Content)
+	}
+	if lang == "en" {
+		return lang, "", nil
+	}
+
+	// 2. Translate to English
+	translatePrompt := map[string]interface{}{
+		"model": "x-ai/grok-4-fast:free",
+		"messages": []map[string]string{
+			{"role": "system", "content": "You are a translation engine. Translate the following text to English. Only output the translation itself, with no preamble, explanation, or extra text."},
+			{"role": "user", "content": text},
+		},
+		"max_tokens": 2048,
+	}
+	translateBody, _ := json.Marshal(translatePrompt)
+	req2, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(translateBody))
+	if err != nil {
+		return lang, "", err
+	}
+	req2.Header.Set("Authorization", "Bearer "+apiKey)
+	req2.Header.Set("Content-Type", "application/json")
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		return lang, "", err
+	}
+	defer resp2.Body.Close()
+	var transResp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	json.Unmarshal(body2, &transResp)
+	translation = ""
+	if len(transResp.Choices) > 0 {
+		translation = strings.TrimSpace(transResp.Choices[0].Message.Content)
+	}
+	return lang, translation, nil
+}
+
 var (
 	rateLimitMu  sync.Mutex
 	rateLimitMap = make(map[string][]int64) // userID -> timestamps
@@ -395,8 +478,9 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	// Only respond to !transcribe
-	if strings.TrimSpace(m.Content) != "!transcribe" {
+	// Only respond to !transcribe or !t
+	cmd := strings.TrimSpace(m.Content)
+	if cmd != "!transcribe" && cmd != "!t" {
 		return
 	}
 
@@ -479,16 +563,44 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			if targetMsg != nil {
 				ref.MessageID = targetMsg.ID
 			}
+			var transcriptMsgID string
 			for i, part := range parts {
 				msgSend := &discordgo.MessageSend{Content: part}
 				if i == 0 {
 					msgSend.Reference = ref
 				}
-				_, err = s.ChannelMessageSendComplex(m.ChannelID, msgSend)
-				if err != nil {
-					log.Printf("Failed to send transcript reply: %v", err)
-					botLogger.Errorf("Failed to send transcript reply for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
+				sentMsg, errSend := s.ChannelMessageSendComplex(m.ChannelID, msgSend)
+				if errSend != nil {
+					log.Printf("Failed to send transcript reply: %v", errSend)
+					botLogger.Errorf("Failed to send transcript reply for user %s (%s): %v", m.Author.Username, m.Author.ID, errSend)
 					break
+				}
+				if i == 0 && sentMsg != nil {
+					transcriptMsgID = sentMsg.ID
+				}
+			}
+			// Translation logic for repeated requests
+			var lang, translation string
+			var terr error
+			lang, translation, terr = detectAndTranslate(transcript)
+			if lang != "en" && translation != "" && terr == nil && transcriptMsgID != "" {
+				transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
+				transRef := &discordgo.MessageReference{
+					MessageID: transcriptMsgID,
+					ChannelID: m.ChannelID,
+					GuildID:   m.GuildID,
+				}
+				for i, part := range transParts {
+					msgSend := &discordgo.MessageSend{Content: part}
+					if i == 0 {
+						msgSend.Reference = transRef
+					}
+					_, err = s.ChannelMessageSendComplex(m.ChannelID, msgSend)
+					if err != nil {
+						log.Printf("Failed to send translation: %v", err)
+						botLogger.Errorf("Failed to send translation for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
+						break
+					}
 				}
 			}
 			return
@@ -601,91 +713,12 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return result
 	}
 
-	// --- Language detection and translation ---
-	// Uses OpenRouter Grok 4 Fast for detection and translation
-	detectAndTranslate := func(text string) (lang string, translation string, err error) {
-		apiKey := os.Getenv("OPENROUTER_API_KEY")
-		if apiKey == "" {
-			return "", "", fmt.Errorf("OPENROUTER_API_KEY not set in environment")
-		}
-
-		// 1. Detect language
-		detectPrompt := map[string]interface{}{
-			"model": "x-ai/grok-4-fast:free",
-			"messages": []map[string]string{
-				{"role": "system", "content": "You are a helpful assistant that detects the ISO 639-1 language code of the following text. Only output the code, nothing else."},
-				{"role": "user", "content": text},
-			},
-			"max_tokens": 8,
-		}
-		detectBody, _ := json.Marshal(detectPrompt)
-		req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(detectBody))
-		if err != nil {
-			return "", "", err
-		}
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return "", "", err
-		}
-		defer resp.Body.Close()
-		var detectResp struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
-		body, _ := io.ReadAll(resp.Body)
-		json.Unmarshal(body, &detectResp)
-		lang = ""
-		if len(detectResp.Choices) > 0 {
-			lang = strings.TrimSpace(detectResp.Choices[0].Message.Content)
-		}
-		if lang == "en" {
-			return lang, "", nil
-		}
-
-		// 2. Translate to English
-		translatePrompt := map[string]interface{}{
-			"model": "x-ai/grok-4-fast:free",
-			"messages": []map[string]string{
-				{"role": "system", "content": "You are a translation engine. Translate the following text to English. Only output the translation itself, with no preamble, explanation, or extra text."},
-				{"role": "user", "content": text},
-			},
-			"max_tokens": 2048,
-		}
-		translateBody, _ := json.Marshal(translatePrompt)
-		req2, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(translateBody))
-		if err != nil {
-			return lang, "", err
-		}
-		req2.Header.Set("Authorization", "Bearer "+apiKey)
-		req2.Header.Set("Content-Type", "application/json")
-		resp2, err := http.DefaultClient.Do(req2)
-		if err != nil {
-			return lang, "", err
-		}
-		defer resp2.Body.Close()
-		var transResp struct {
-			Choices []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			} `json:"choices"`
-		}
-		body2, _ := io.ReadAll(resp2.Body)
-		json.Unmarshal(body2, &transResp)
-		translation = ""
-		if len(transResp.Choices) > 0 {
-			translation = strings.TrimSpace(transResp.Choices[0].Message.Content)
-		}
-		return lang, translation, nil
-	}
+	var lang, translation string
+	var terr error
+	lang, translation, terr = detectAndTranslate(transcript)
+	// ... existing code ...
 
 	replyText := username + " said, \"" + transcript + "\""
-	lang, translation, terr := detectAndTranslate(transcript)
 
 	parts := splitMessage(replyText, maxDiscordMsgLen)
 	ref := &discordgo.MessageReference{
