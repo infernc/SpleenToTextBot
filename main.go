@@ -510,12 +510,6 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return false, 0
 	}
 
-	limited, mins := isRateLimited(m.Author.ID)
-	if limited {
-		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("rate limit exceeded. counter resets in %d minutes", mins))
-		return
-	}
-
 	// Respond to !usage command
 	cmd := strings.TrimSpace(m.Content)
 	if cmd == "!usage" {
@@ -525,6 +519,12 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 	// Only respond to !transcribe or !t
 	if cmd != "!transcribe" && cmd != "!t" {
+		return
+	}
+	// Check rate limit
+	limited, mins := isRateLimited(m.Author.ID)
+	if limited {
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("rate limit exceeded. counter resets in %d minutes", mins))
 		return
 	}
 
