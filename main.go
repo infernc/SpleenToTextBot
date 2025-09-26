@@ -255,7 +255,7 @@ func transcribeWithJobID(filePath string) (string, string, error) {
 // var (
 // --- Language detection and translation ---
 // Uses OpenRouter Grok 4 Fast for detection and translation
-func detectAndTranslate(text string) (lang string, translation string, err error) {
+func detectAndTranslate(text string, channelID string, typingIndicator func(string) error) (lang string, translation string, err error) {
 	apiKey := os.Getenv("OPENROUTER_API_KEY")
 	if apiKey == "" {
 		return "", "", fmt.Errorf("OPENROUTER_API_KEY not set in environment")
@@ -300,6 +300,7 @@ func detectAndTranslate(text string) (lang string, translation string, err error
 	}
 
 	// 2. Translate to English
+	typingIndicator(channelID) // Typing indicator for translation
 	translatePrompt := map[string]interface{}{
 		"model": "x-ai/grok-4-fast:free",
 		"messages": []map[string]string{
@@ -583,6 +584,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		jobID, jobIDExists := audioMsgIDToJobID[audioMsgID]
 		transcribedMu.Unlock()
 		if already && jobIDExists {
+			s.ChannelTyping(m.ChannelID) // Typing indicator for repeated request
 			transcript, err := fetchSpeechmaticsTranscript(jobID)
 			if err != nil {
 				s.ChannelMessageSend(m.ChannelID, "Error fetching previous transcript: "+err.Error())
@@ -627,7 +629,9 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			var terr error
 			if transcriptMsgID != "" {
 				go func(transcript string, transcriptMsgID string) {
-					lang, translation, terr = detectAndTranslate(transcript)
+					lang, translation, terr = detectAndTranslate(transcript, m.ChannelID, func(channelID string) error {
+						return s.ChannelTyping(channelID)
+					})
 					if lang != "en" && translation != "" && terr == nil {
 						transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
 						transRef := &discordgo.MessageReference{
@@ -676,6 +680,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
+	s.ChannelTyping(m.ChannelID) // Typing indicator for new transcription
 	tmpFile, err := downloadFile(att.URL)
 	if err != nil {
 		botLogger.Logf("Transcription request: user=%s (%s), targetUser=unknown, transcript=", m.Author.Username, m.Author.ID)
@@ -793,7 +798,9 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	var terr error
 	if transcriptMsgID != "" {
 		go func(transcript string, transcriptMsgID string) {
-			lang, translation, terr = detectAndTranslate(transcript)
+			lang, translation, terr = detectAndTranslate(transcript, m.ChannelID, func(channelID string) error {
+            return s.ChannelTyping(channelID)
+        })
 			if lang != "en" && translation != "" && terr == nil {
 				transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
 				transRef := &discordgo.MessageReference{
