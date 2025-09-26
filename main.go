@@ -478,9 +478,9 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	// --- Rate limiting: 15 uses per 60 minutes per user ---
+	// --- Rate limiting: 15 uses per 5 minutes per user ---
 	const rateLimitCount = 15
-	const rateLimitWindow = 60 * 60 // seconds
+	const rateLimitWindow = 60 * 5 // seconds
 
 	isRateLimited := func(userID string) (bool, int) {
 		rateLimitMu.Lock()
@@ -576,7 +576,6 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if targetMsg != nil {
 		audioMsgID = targetMsg.ID
 	}
-	// ...existing code...
 
 	if audioMsgID != "" {
 		transcribedMu.Lock()
@@ -626,26 +625,30 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			// Translation logic for repeated requests
 			var lang, translation string
 			var terr error
-			lang, translation, terr = detectAndTranslate(transcript)
-			if lang != "en" && translation != "" && terr == nil && transcriptMsgID != "" {
-				transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
-				transRef := &discordgo.MessageReference{
-					MessageID: transcriptMsgID,
-					ChannelID: m.ChannelID,
-					GuildID:   m.GuildID,
-				}
-				for i, part := range transParts {
-					msgSend := &discordgo.MessageSend{Content: part}
-					if i == 0 {
-						msgSend.Reference = transRef
+			if transcriptMsgID != "" {
+				go func(transcript string, transcriptMsgID string) {
+					lang, translation, terr = detectAndTranslate(transcript)
+					if lang != "en" && translation != "" && terr == nil {
+						transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
+						transRef := &discordgo.MessageReference{
+							MessageID: transcriptMsgID,
+							ChannelID: m.ChannelID,
+							GuildID:   m.GuildID,
+						}
+						for i, part := range transParts {
+							msgSend := &discordgo.MessageSend{Content: part}
+							if i == 0 {
+								msgSend.Reference = transRef
+							}
+							_, err = s.ChannelMessageSendComplex(m.ChannelID, msgSend)
+							if err != nil {
+								log.Printf("Failed to send translation: %v", err)
+								botLogger.Errorf("Failed to send translation for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
+								break
+							}
+						}
 					}
-					_, err = s.ChannelMessageSendComplex(m.ChannelID, msgSend)
-					if err != nil {
-						log.Printf("Failed to send translation: %v", err)
-						botLogger.Errorf("Failed to send translation for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
-						break
-					}
-				}
+				}(transcript, transcriptMsgID)
 			}
 			return
 		} else if already {
@@ -757,13 +760,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return result
 	}
 
-	var lang, translation string
-	var terr error
-	lang, translation, terr = detectAndTranslate(transcript)
-	// ... existing code ...
-
 	replyText := username + " said, \"" + transcript + "\""
-
 	parts := splitMessage(replyText, maxDiscordMsgLen)
 	ref := &discordgo.MessageReference{
 		MessageID: m.ID,
@@ -792,24 +789,31 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	}
 
 	// If not English and translation succeeded, send translation as a reply to the transcript message
-	if lang != "en" && translation != "" && terr == nil && transcriptMsgID != "" {
-		transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
-		transRef := &discordgo.MessageReference{
-			MessageID: transcriptMsgID,
-			ChannelID: m.ChannelID,
-			GuildID:   m.GuildID,
-		}
-		for i, part := range transParts {
-			msgSend := &discordgo.MessageSend{Content: part}
-			if i == 0 {
-				msgSend.Reference = transRef
+	var lang, translation string
+	var terr error
+	if transcriptMsgID != "" {
+		go func(transcript string, transcriptMsgID string) {
+			lang, translation, terr = detectAndTranslate(transcript)
+			if lang != "en" && translation != "" && terr == nil {
+				transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
+				transRef := &discordgo.MessageReference{
+					MessageID: transcriptMsgID,
+					ChannelID: m.ChannelID,
+					GuildID:   m.GuildID,
+				}
+				for i, part := range transParts {
+					msgSend := &discordgo.MessageSend{Content: part}
+					if i == 0 {
+						msgSend.Reference = transRef
+					}
+					_, err = s.ChannelMessageSendComplex(m.ChannelID, msgSend)
+					if err != nil {
+						log.Printf("Failed to send translation: %v", err)
+						botLogger.Errorf("Failed to send translation for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
+						break
+					}
+				}
 			}
-			_, err = s.ChannelMessageSendComplex(m.ChannelID, msgSend)
-			if err != nil {
-				log.Printf("Failed to send translation: %v", err)
-				botLogger.Errorf("Failed to send translation for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
-				break
-			}
-		}
+		}(transcript, transcriptMsgID)
 	}
 }
