@@ -21,7 +21,7 @@ import (
 )
 
 // Helper to split at word boundaries
-const maxDiscordMsgLen = 4000
+const maxDiscordMsgLen = 2000
 
 // getSpeechmaticsUsage fetches usage statistics from Speechmatics API
 func getSpeechmaticsUsage() string {
@@ -733,7 +733,7 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	const maxDiscordMsgLen = 4000
+	const maxDiscordMsgLen = 2000
 
 	// Helper to split at word boundaries
 	splitMessage := func(s string, maxLen int) []string {
@@ -799,8 +799,8 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 	if transcriptMsgID != "" {
 		go func(transcript string, transcriptMsgID string) {
 			lang, translation, terr = detectAndTranslate(transcript, m.ChannelID, func(channelID string) error {
-            return s.ChannelTyping(channelID)
-        })
+				return s.ChannelTyping(channelID)
+			})
 			if lang != "en" && translation != "" && terr == nil {
 				transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
 				transRef := &discordgo.MessageReference{
