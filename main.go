@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -23,13 +24,25 @@ import (
 // Helper to split at word boundaries
 const maxDiscordMsgLen = 2000
 
-// getSpeechmaticsUsage fetches usage statistics from Speechmatics API
+// getSpeechmaticsUsage fetches usage statistics from Speechmatics API for the current month
 func getSpeechmaticsUsage() string {
 	apiKey := os.Getenv("SPEECHMATICS_API_KEY")
 	if apiKey == "" {
 		return "SPEECHMATICS_API_KEY not set in environment"
 	}
-	url := "https://asr.api.speechmatics.com/v2/usage"
+
+	// Calculate date range for current month
+	now := time.Now()
+	year, month, _ := now.Date()
+
+	// First day of current month
+	from := time.Date(year, month, 1, 0, 0, 0, 0, now.Location())
+	// Last day of current month (or today if we're past the last day)
+	lastDay := time.Date(year, month+1, 0, 23, 59, 59, 999999999, now.Location())
+
+	url := fmt.Sprintf("https://asr.api.speechmatics.com/v2/usage?since=%s&until=%s",
+		from.Format("2006-01-02"), lastDay.Format("2006-01-02"))
+
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "Error creating usage request: " + err.Error()
@@ -47,18 +60,26 @@ func getSpeechmaticsUsage() string {
 	}
 	// Parse response
 	var usageResp struct {
-		Details []struct {
+		Summary []struct {
 			DurationHrs float64 `json:"duration_hrs"`
-		} `json:"details"`
+			Count       int     `json:"count"`
+		} `json:"summary"`
 	}
 	if err := json.Unmarshal(body, &usageResp); err != nil {
 		return "Error parsing usage response: " + err.Error()
 	}
 	var totalMinutes float64
-	for _, d := range usageResp.Details {
-		totalMinutes += d.DurationHrs * 60.0
+	var totalJobs int
+	if len(usageResp.Summary) > 0 {
+		totalMinutes = usageResp.Summary[0].DurationHrs * 60.0
+		totalJobs = usageResp.Summary[0].Count
 	}
-	return fmt.Sprintf("Speechmatics API usage: %.2f minutes used out of 480.", totalMinutes)
+	secondsPortion := (totalMinutes - math.Floor(totalMinutes)) * 60.0
+	minutesPortion := int(math.Floor(totalMinutes))
+
+	// Format month name for display
+	monthName := from.Format("Jan, 2006")
+	return fmt.Sprintf("Usage for %s: %d minutes %.1f seconds\nNumber of requests serviced: %d\nMonthly usage limit: 480 minutes", monthName, minutesPortion, secondsPortion, totalJobs)
 }
 
 func splitMessage(s string, maxLen int) []string {
@@ -251,92 +272,6 @@ func transcribeWithJobID(filePath string) (string, string, error) {
 	}
 }
 
-// --- Rate limiting and duplicate prevention globals ---
-// var (
-// --- Language detection and translation ---
-// Uses OpenRouter Grok 4 Fast for detection and translation
-func detectAndTranslate(text string, channelID string, typingIndicator func(string) error) (lang string, translation string, err error) {
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	if apiKey == "" {
-		return "", "", fmt.Errorf("OPENROUTER_API_KEY not set in environment")
-	}
-
-	// 1. Detect language
-	detectPrompt := map[string]interface{}{
-		"model": "x-ai/grok-4-fast:free",
-		"messages": []map[string]string{
-			{"role": "system", "content": "You are a helpful assistant that detects the ISO 639-1 language code of the following text. Only output the code, nothing else."},
-			{"role": "user", "content": text},
-		},
-		"max_tokens": 8,
-	}
-	detectBody, _ := json.Marshal(detectPrompt)
-	req, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(detectBody))
-	if err != nil {
-		return "", "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-	var detectResp struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	body, _ := io.ReadAll(resp.Body)
-	json.Unmarshal(body, &detectResp)
-	lang = ""
-	if len(detectResp.Choices) > 0 {
-		lang = strings.TrimSpace(detectResp.Choices[0].Message.Content)
-	}
-	if lang == "en" {
-		return lang, "", nil
-	}
-
-	// 2. Translate to English
-	typingIndicator(channelID) // Typing indicator for translation
-	translatePrompt := map[string]interface{}{
-		"model": "x-ai/grok-4-fast:free",
-		"messages": []map[string]string{
-			{"role": "system", "content": "You are a translation engine. Translate the following text to English. Only output the translation itself, with no preamble, explanation, or extra text."},
-			{"role": "user", "content": text},
-		},
-		"max_tokens": 2048,
-	}
-	translateBody, _ := json.Marshal(translatePrompt)
-	req2, err := http.NewRequest("POST", "https://openrouter.ai/api/v1/chat/completions", bytes.NewReader(translateBody))
-	if err != nil {
-		return lang, "", err
-	}
-	req2.Header.Set("Authorization", "Bearer "+apiKey)
-	req2.Header.Set("Content-Type", "application/json")
-	resp2, err := http.DefaultClient.Do(req2)
-	if err != nil {
-		return lang, "", err
-	}
-	defer resp2.Body.Close()
-	var transResp struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	body2, _ := io.ReadAll(resp2.Body)
-	json.Unmarshal(body2, &transResp)
-	translation = ""
-	if len(transResp.Choices) > 0 {
-		translation = strings.TrimSpace(transResp.Choices[0].Message.Content)
-	}
-	return lang, translation, nil
-}
-
 var (
 	rateLimitMu  sync.Mutex
 	rateLimitMap = make(map[string][]int64) // userID -> timestamps
@@ -450,6 +385,14 @@ func main() {
 		log.Fatalf("Error creating Discord session: %v", err)
 	}
 
+	dg.Identify.Intents = discordgo.IntentsGuilds |
+		discordgo.IntentsGuildMessages |
+		discordgo.IntentsGuildMembers |
+		discordgo.IntentsMessageContent
+
+	dg.StateEnabled = true
+
+	dg.AddHandler(requestMembers)
 	dg.AddHandler(messageCreate)
 
 	if err := dg.Open(); err != nil {
@@ -470,6 +413,17 @@ func main() {
 	dg.Close()
 	if err := botLogger.SaveToFile(); err != nil {
 		log.Printf("Failed to save log: %v", err)
+	}
+}
+
+func requestMembers(s *discordgo.Session, g *discordgo.GuildCreate) {
+	log.Printf("Requesting members for guild: %s", g.Name)
+
+	// Request all members for this guild, which forces Discord to send member data.
+	err := s.RequestGuildMembers(g.ID, "", 0, "", true)
+
+	if err != nil {
+		log.Printf("Error requesting guild members for %s: %v", g.Name, err)
 	}
 }
 
@@ -596,63 +550,48 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 			}
 			username := "Someone"
 			if targetMsg != nil && targetMsg.Author != nil {
-				username = targetMsg.Author.Username
+				if targetMsg.Member != nil && targetMsg.Member.Nick != "" {
+					username = targetMsg.Member.Nick
+				} else {
+					var member *discordgo.Member
+					member, err = s.State.Member(m.GuildID, targetMsg.Author.ID)
+					if err == nil && member.Nick != "" {
+						username = member.Nick
+					} else {
+						// Fall back to the global username or global display name
+						username = targetMsg.Author.Username
+						botLogger.Logf("%v", err)
+					}
+				}
 			}
-			replyText := username + " said, \"" + transcript + "\""
+			// Build reply that references the summon (command) message and
+			// include a formatted link to the original audio message when available.
+			var replyText string
+			if targetMsg != nil {
+				audioURL := fmt.Sprintf("https://discord.com/channels/%s/%s/%s", m.GuildID, targetMsg.ChannelID, targetMsg.ID)
+				replyText = fmt.Sprintf("[%s:](%s) \"%s\"", username, audioURL, transcript)
+			} else {
+				replyText = fmt.Sprintf("%s: \"%s\"", username, transcript)
+			}
 			parts := splitMessage(replyText, maxDiscordMsgLen)
+			// Always reply to the summon (command) message so the response appears
+			// as a reply to the user who invoked the bot.
 			ref := &discordgo.MessageReference{
 				MessageID: m.ID,
 				ChannelID: m.ChannelID,
 				GuildID:   m.GuildID,
 			}
-			if targetMsg != nil {
-				ref.MessageID = targetMsg.ID
-			}
-			var transcriptMsgID string
 			for i, part := range parts {
 				msgSend := &discordgo.MessageSend{Content: part}
 				if i == 0 {
 					msgSend.Reference = ref
 				}
-				sentMsg, errSend := s.ChannelMessageSendComplex(m.ChannelID, msgSend)
+				_, errSend := s.ChannelMessageSendComplex(m.ChannelID, msgSend)
 				if errSend != nil {
 					log.Printf("Failed to send transcript reply: %v", errSend)
 					botLogger.Errorf("Failed to send transcript reply for user %s (%s): %v", m.Author.Username, m.Author.ID, errSend)
 					break
 				}
-				if i == 0 && sentMsg != nil {
-					transcriptMsgID = sentMsg.ID
-				}
-			}
-			// Translation logic for repeated requests
-			var lang, translation string
-			var terr error
-			if transcriptMsgID != "" {
-				go func(transcript string, transcriptMsgID string) {
-					lang, translation, terr = detectAndTranslate(transcript, m.ChannelID, func(channelID string) error {
-						return s.ChannelTyping(channelID)
-					})
-					if lang != "en" && translation != "" && terr == nil {
-						transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
-						transRef := &discordgo.MessageReference{
-							MessageID: transcriptMsgID,
-							ChannelID: m.ChannelID,
-							GuildID:   m.GuildID,
-						}
-						for i, part := range transParts {
-							msgSend := &discordgo.MessageSend{Content: part}
-							if i == 0 {
-								msgSend.Reference = transRef
-							}
-							_, err = s.ChannelMessageSendComplex(m.ChannelID, msgSend)
-							if err != nil {
-								log.Printf("Failed to send translation: %v", err)
-								botLogger.Errorf("Failed to send translation for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
-								break
-							}
-						}
-					}
-				}(transcript, transcriptMsgID)
 			}
 			return
 		} else if already {
@@ -703,22 +642,34 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		transcript, jobID, transcribeErr = transcribeWithJobID(tmpFile)
 	}()
 
-	username := "Someone"
-	userID := ""
-	if targetMsg != nil && targetMsg.Author != nil {
-		username = targetMsg.Author.Username
-		userID = targetMsg.Author.ID
-	}
-
-	// Log every transcription request, even if blank
-	botLogger.Logf("Transcription request: user=%s (%s), targetUser=%s (%s), transcript=%q, jobID=%s", m.Author.Username, m.Author.ID, username, userID, transcript, jobID)
-
 	if transcribeErr != nil {
 		log.Printf("Transcription failed: %v", transcribeErr)
 		botLogger.Errorf("Transcription failed for user %s (%s): %v", m.Author.Username, m.Author.ID, transcribeErr)
 		s.ChannelMessageSend(m.ChannelID, "Error transcribing: "+transcribeErr.Error())
 		return
 	}
+
+	username := "Someone"
+	userID := ""
+	if targetMsg != nil && targetMsg.Author != nil {
+		if targetMsg.Member != nil && targetMsg.Member.Nick != "" {
+			username = targetMsg.Member.Nick
+		} else {
+			var member *discordgo.Member
+			member, err = s.State.Member(m.GuildID, targetMsg.Author.ID) //only method that works
+			if err == nil && member.Nick != "" {
+				username = member.Nick
+			} else {
+				// Fall back to the global username or global display name
+				username = targetMsg.Author.Username
+				botLogger.Logf("%v", err)
+			}
+		}
+		userID = targetMsg.Author.ID
+	}
+
+	// Log every transcription request, even if blank
+	botLogger.Logf("Transcription request: user=%s (%s), targetUser=%s (%s), jobID=%s", m.Author.Username, m.Author.ID, username, userID, jobID)
 
 	// Store jobID for future duplicate requests
 	if audioMsgID != "" && jobID != "" {
@@ -765,62 +716,34 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return result
 	}
 
-	replyText := username + " said, \"" + transcript + "\""
+	// Build reply that references the summon (command) message and
+	// include a formatted link to the original audio message when available.
+	var replyText string
+	if targetMsg != nil {
+		audioURL := fmt.Sprintf("https://discord.com/channels/%s/%s/%s", m.GuildID, targetMsg.ChannelID, targetMsg.ID)
+		replyText = fmt.Sprintf("[%s:](%s) \"%s\"", username, audioURL, transcript)
+	} else {
+		replyText = fmt.Sprintf("%s: \"%s\"", username, transcript)
+	}
 	parts := splitMessage(replyText, maxDiscordMsgLen)
+	// Always reply to the summon (command) message so the response appears
+	// as a reply to the user who invoked the bot.
 	ref := &discordgo.MessageReference{
 		MessageID: m.ID,
 		ChannelID: m.ChannelID,
 		GuildID:   m.GuildID,
 	}
-	if targetMsg != nil {
-		ref.MessageID = targetMsg.ID
-	}
 
-	var transcriptMsgID string
 	for i, part := range parts {
 		msgSend := &discordgo.MessageSend{Content: part}
 		if i == 0 {
 			msgSend.Reference = ref
 		}
-		sentMsg, errSend := s.ChannelMessageSendComplex(m.ChannelID, msgSend)
+		_, errSend := s.ChannelMessageSendComplex(m.ChannelID, msgSend)
 		if errSend != nil {
 			log.Printf("Failed to send transcript reply: %v", errSend)
 			botLogger.Errorf("Failed to send transcript reply for user %s (%s): %v", m.Author.Username, m.Author.ID, errSend)
 			break
 		}
-		if i == 0 && sentMsg != nil {
-			transcriptMsgID = sentMsg.ID
-		}
-	}
-
-	// If not English and translation succeeded, send translation as a reply to the transcript message
-	var lang, translation string
-	var terr error
-	if transcriptMsgID != "" {
-		go func(transcript string, transcriptMsgID string) {
-			lang, translation, terr = detectAndTranslate(transcript, m.ChannelID, func(channelID string) error {
-				return s.ChannelTyping(channelID)
-			})
-			if lang != "en" && translation != "" && terr == nil {
-				transParts := splitMessage("Translation: "+translation, maxDiscordMsgLen)
-				transRef := &discordgo.MessageReference{
-					MessageID: transcriptMsgID,
-					ChannelID: m.ChannelID,
-					GuildID:   m.GuildID,
-				}
-				for i, part := range transParts {
-					msgSend := &discordgo.MessageSend{Content: part}
-					if i == 0 {
-						msgSend.Reference = transRef
-					}
-					_, err = s.ChannelMessageSendComplex(m.ChannelID, msgSend)
-					if err != nil {
-						log.Printf("Failed to send translation: %v", err)
-						botLogger.Errorf("Failed to send translation for user %s (%s): %v", m.Author.Username, m.Author.ID, err)
-						break
-					}
-				}
-			}
-		}(transcript, transcriptMsgID)
 	}
 }
