@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -364,6 +365,28 @@ func downloadFile(url string) (string, error) {
 	return tmpPath, nil
 }
 
+// startTypingLoop starts a cancellable background goroutine that keeps the
+// typing indicator active in `channelID` until the returned cancel function
+// is called. It triggers an immediate typing event, then repeats every 8s.
+func startTypingLoop(s *discordgo.Session, channelID string) context.CancelFunc {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		// Send an initial typing event immediately
+		s.ChannelTyping(channelID)
+		ticker := time.NewTicker(8 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.ChannelTyping(channelID)
+			}
+		}
+	}()
+	return cancel
+}
+
 func main() {
 	// Load environment variables from .env
 	if err := godotenv.Load(); err != nil {
@@ -538,7 +561,8 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		jobID, jobIDExists := audioMsgIDToJobID[audioMsgID]
 		transcribedMu.Unlock()
 		if already && jobIDExists {
-			s.ChannelTyping(m.ChannelID) // Typing indicator for repeated request
+			cancelTyping := startTypingLoop(s, m.ChannelID) // keep typing until we reply
+			defer cancelTyping()
 			transcript, err := fetchSpeechmaticsTranscript(jobID)
 			if err != nil {
 				s.ChannelMessageSend(m.ChannelID, "Error fetching previous transcript: "+err.Error())
@@ -619,7 +643,8 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	s.ChannelTyping(m.ChannelID) // Typing indicator for new transcription
+	cancelTyping := startTypingLoop(s, m.ChannelID) // keep typing until we reply
+	defer cancelTyping()
 	tmpFile, err := downloadFile(att.URL)
 	if err != nil {
 		botLogger.Logf("Transcription request: user=%s (%s), targetUser=unknown, transcript=", m.Author.Username, m.Author.ID)
