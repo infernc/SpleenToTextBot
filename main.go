@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -495,7 +496,34 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		s.ChannelMessageSend(m.ChannelID, usageMsg)
 		return
 	}
-	// Only respond to !transcribe or !t
+
+	// Respond to f2c command
+	if strings.HasPrefix(cmd, "f2c ") {
+		tempStr := strings.TrimSpace(strings.TrimPrefix(cmd, "f2c "))
+		tempF, err := strconv.ParseFloat(tempStr, 64)
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, "Invalid temperature value. Please provide a number.")
+			return
+		}
+		tempC := (tempF - 32) * 5 / 9
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("%.1f°F is %.1f°C", tempF, tempC))
+		return
+	}
+
+	// Respond to c2f command
+	if strings.HasPrefix(cmd, "c2f ") {
+		tempStr := strings.TrimSpace(strings.TrimPrefix(cmd, "c2f "))
+		tempC, err := strconv.ParseFloat(tempStr, 64)
+		if err != nil {
+			s.ChannelMessageSend(m.ChannelID, "Invalid temperature value. Please provide a number.")
+			return
+		}
+		tempF := tempC*9/5 + 32
+		s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("%.1f°C is %.1f°F", tempC, tempF))
+		return
+	}
+
+	// Respond to !transcribe or !t
 	if cmd != "!transcribe" && cmd != "!t" {
 		return
 	}
