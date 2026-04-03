@@ -276,6 +276,15 @@ func formatTranscript(resp TranscriptResponse, withTimestamps bool) string {
 		}
 		
 		content := item.Alternatives[0].Content
+		
+		// Skip standalone punctuation marks (they cause orphan lines like ".")
+		// These are already handled by the spacing logic that attaches punctuation to words
+		if content == "." || content == "," || content == "!" || content == "?" || 
+		   content == ";" || content == ":" || content == "..." || content == "–" ||
+		   content == "-" || content == "—" {
+			continue
+		}
+		
 		words = append(words, struct {
 			Text      string
 			StartTime float64
@@ -345,7 +354,7 @@ func formatTranscript(resp TranscriptResponse, withTimestamps bool) string {
 		}
 		result.WriteString(line.Text)
 		if i < len(lines)-1 {
-			result.WriteString("\n\n")
+			result.WriteString("\n")
 		}
 	}
 	
@@ -386,7 +395,7 @@ func transcribeWithJobID(filePath string) (TranscriptResponse, string, error) {
 	writer := multipart.NewWriter(&buf)
 
 	// Add config part
-	config := `{"type": "transcription", "transcription_config": {"language": "auto", "diarization": "none", "operating_point": "enhanced", "enable_entities": true}}`
+	config := `{"type": "transcription", "transcription_config": {"language": "auto", "diarization": "none", "operating_point": "enhanced", "enable_entities": true, "transcript_filtering_config": {"remove_disfluencies": true}}}`
 	if err := writer.WriteField("config", config); err != nil {
 		return TranscriptResponse{}, "", err
 	}
