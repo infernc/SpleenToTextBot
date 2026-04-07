@@ -28,6 +28,22 @@ import (
 // Helper to split at word boundaries
 const maxDiscordMsgLen = 2000
 
+// punctuationTokens defines tokens that represent punctuation when they appear as
+// separate transcript items. They will be attached to the preceding word. Tokens
+// that appear without a preceding word are considered orphan punctuation lines
+// and will be omitted.
+var punctuationTokens = []string{".", ",", "!", "?", ";", ":", "...", "–", "-", "—"}
+
+// isPunctuation reports whether the given token is a punctuation token.
+func isPunctuation(tok string) bool {
+	for _, p := range punctuationTokens {
+		if tok == p {
+			return true
+		}
+	}
+	return false
+}
+
 // Resilience config for handling long audio
 const (
 	maxTranscriptSize = 10 * 1024 * 1024        // 10MB max for transcript JSON (17min audio ~1-2MB)
@@ -105,79 +121,86 @@ func getSpeechmaticsUsage() string {
 
 	// Format month name for display
 	monthName := from.Format("Jan, 2006")
-	return fmt.Sprintf("Usage for %s: %d minutes %.1f seconds\nNumber of requests serviced: %d\nMonthly usage limit: 480 minutes", monthName, minutesPortion, secondsPortion, totalJobs)
+	return fmt.Sprintf("Usage for %s: %d minutes %.1f seconds\nNumber of requests serviced: %d\nMonthly usage limit: 120 minutes", monthName, minutesPortion, secondsPortion, totalJobs)
 }
 
 func splitMessage(s string, maxLen int) []string {
-	var result []string
-	runes := []rune(s)
-	for len(runes) > 0 {
-		if len(runes) <= maxLen {
-			result = append(result, string(runes))
-			break
-		}
-		// Find best split point before maxLen
-		// Priority: 1) \n\n (between blocks)  2) space  3) single \n (but not after -# MM:SS)
-		cut := maxLen
-		found := false
-		
-		// First try: find \n\n (between transcript blocks)
-		for i := maxLen; i > 1; i-- {
-			if runes[i] == '\n' && runes[i-1] == '\n' {
-				cut = i + 1
-				found = true
+    var result []string
+    runes := []rune(s)
+
+    for len(runes) > 0 {
+        // If the remaining text fits, emit it and stop.
+        if len(runes) <= maxLen {
+            result = append(result, string(runes))
+            break
+        }
+
+        // -----------------------------------------------------------------
+        // 1️⃣ Find a natural split point: space or newline before maxLen.
+        // -----------------------------------------------------------------
+        cut := maxLen
+		// Prefer a newline before maxLen (keeps logical blocks together).
+		for i := maxLen - 1; i > 0; i-- {
+			if runes[i] == '\n' {
+				cut = i // exclude the newline; we'll trim it later
 				break
 			}
 		}
-		
-		// Second try: find space
-		if !found {
-			for i := maxLen; i > 0; i-- {
+		// If no newline, fall back to the last space.
+		if cut == maxLen {
+			for i := maxLen - 1; i > 0; i-- {
 				if runes[i] == ' ' {
 					cut = i
-					found = true
 					break
 				}
 			}
 		}
-		
-		// Third try: find single \n but NOT right after "-# MM:SS"
-		if !found {
-			for i := maxLen; i > 0; i-- {
-				if runes[i] == '\n' {
-					// Check if this is right after a timestamp line
-					// Look backwards for "-# " pattern
-					isAfterTimestamp := false
-					for j := i - 1; j >= 0 && j > i-10; j-- {
-						if j >= 2 && runes[j] == '#' && runes[j-1] == '-' {
-							isAfterTimestamp = true
-							break
-						}
-						if runes[j] == '\n' {
-							break
-						}
-					}
-					if !isAfterTimestamp {
-						cut = i + 1
-						found = true
-						break
-					}
-				}
-			}
+
+        // -----------------------------------------------------------------
+        // 2️⃣ Ensure we are not cutting inside a timestamp pattern.
+        //    Look backward from the cut point to see if there's a "-#"
+        //    within the last 10 runes. If there is, check if the full
+        //    timestamp fits inside the pattern. If it doesn't, we're inside
+        //    a timestamp and must move cut to before it.
+        // -----------------------------------------------------------------
+        if cut > 0 {
+            // Scan backward from cut to find a potential timestamp start.
+            for start := cut - 1; start >= 0 && start >= cut-10; start-- {
+                if runes[start] == '-' && start+1 < len(runes) && runes[start+1] == '#' {
+                    // Found "-#". Verify the full timestamp pattern exists.
+                    if start+2 < len(runes) && runes[start+2] == ' ' && start+8 < len(runes) && runes[start+8] == '\n' {
+                        // Full timestamp pattern found at [start, start+8].
+                        // If our cut point (cut) falls within or after the start but before the newline,
+                        // we are inside or about to split the timestamp.
+                        if start < cut && cut <= start+8 {
+                            // Move cut to before the timestamp.
+                            cut = start
+                        }
+                    }
+                    break
+                }
+            }
+        }
+
+		// Guard against a zero‑length cut (which would cause an infinite loop).
+		// This can happen if a timestamp starts at the very beginning of the
+		// remaining slice. In that case we fall back to a hard cut at maxLen.
+		if cut == 0 {
+			cut = maxLen
 		}
-		
-		if !found {
-			cut = maxLen // hard cut as last resort
+
+		// Emit the segment (skip empty segments just in case).
+		if cut > 0 {
+			result = append(result, string(runes[:cut]))
 		}
-		
-		result = append(result, string(runes[:cut]))
 		runes = runes[cut:]
-		// Trim leading spaces/newlines
+
+		// Trim leading spaces/newlines for the next iteration.
 		for len(runes) > 0 && (runes[0] == ' ' || runes[0] == '\n') {
 			runes = runes[1:]
 		}
-	}
-	return result
+    }
+    return result
 }
 
 // Speechmatics transcript item from JSON response
@@ -274,25 +297,29 @@ func formatTranscript(resp TranscriptResponse, withTimestamps bool) string {
 		if len(item.Alternatives) == 0 {
 			continue
 		}
-		
+
 		content := item.Alternatives[0].Content
-		
-		// Skip standalone punctuation marks (they cause orphan lines like ".")
-		// These are already handled by the spacing logic that attaches punctuation to words
-		if content == "." || content == "," || content == "!" || content == "?" || 
-		   content == ";" || content == ":" || content == "..." || content == "–" ||
-		   content == "-" || content == "—" {
+		clean := strings.TrimSpace(content)
+
+		// Attach punctuation tokens to the preceding word. If there is no preceding
+		// word, treat it as a standalone punctuation line and skip it.
+		if isPunctuation(clean) {
+			if len(words) > 0 {
+				// Append directly without a space.
+				words[len(words)-1].Text += clean
+			}
 			continue
 		}
-		
+
+		// Normal word token – keep it.
 		words = append(words, struct {
 			Text      string
 			StartTime float64
-		}{Text: content, StartTime: item.StartTime})
-		
+		}{Text: clean, StartTime: item.StartTime})
+
 		// Log progress every 500 items (commented out for memory efficiency)
 		// if (idx+1) % 500 == 0 {
-		// 	botLogger.Logf("[DEBUG] formatTranscript progress: %d/%d items, %d words collected", idx+1, len(resp.Results), len(words))
+		//  botLogger.Logf("[DEBUG] formatTranscript progress: %d/%d items, %d words collected", idx+1, len(resp.Results), len(words))
 		// }
 	}
 	
@@ -820,9 +847,9 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 		return
 	}
 
-	// Respond to !transcribe or !t (with optional -s flag for timestamps)
+	// Respond to !transcribe, !t, or the new alias !ts (with optional -s flag for timestamps)
 	showTimestamps := false
-	if strings.HasPrefix(cmd, "!transcribe ") || strings.HasPrefix(cmd, "!t ") {
+	if strings.HasPrefix(cmd, "!transcribe ") || strings.HasPrefix(cmd, "!t ") || strings.HasPrefix(cmd, "!ts ") {
 		// Parse flags
 		parts := strings.Fields(cmd)
 		for _, part := range parts[1:] {
@@ -830,7 +857,9 @@ func messageCreate(s *discordgo.Session, m *discordgo.MessageCreate) {
 				showTimestamps = true
 			}
 		}
-	} else if cmd != "!transcribe" && cmd != "!t" {
+	} else if cmd == "!ts" { // alias without additional flags defaults to timestamps on
+		showTimestamps = true
+	} else if cmd != "!transcribe" && cmd != "!t" && cmd != "!ts" {
 		return
 	}
 	// Check rate limit
